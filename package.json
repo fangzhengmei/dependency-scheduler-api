@@ -1,0 +1,29 @@
+{
+  "name": "dependency-scheduler-api",
+  "version": "1.0.0",
+  "description": "Task dependency scheduler API with Node.js, Express, SQLite3, and Jest",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "test": "jest --coverage",
+    "test:watch": "jest --watch"
+  },
+  "keywords": ["task", "scheduler", "dependency", "express", "sqlite", "jest"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "sqlite3": "^5.1.6"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^6.3.3",
+    "nodemon": "^3.0.1"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": ["**/tests/**/*.test.js"],
+    "collectCoverageFrom": ["src/**/*.js", "!src/server.js"]
+  }
+}
