@@ -2,11 +2,50 @@ const TaskModel = require('../models/taskModel');
 const ExecutionHistoryModel = require('../models/executionHistoryModel');
 const TopologyService = require('./topologyService');
 
+const VALID_TRANSITIONS = {
+  pending: ['running'],
+  running: ['completed', 'failed'],
+  completed: [],
+  failed: [],
+  blocked: ['pending']
+};
+
 const ExecutionService = {
+  canTransition: (currentStatus, targetStatus) => {
+    const validTransitions = VALID_TRANSITIONS[currentStatus] || [];
+    return validTransitions.includes(targetStatus);
+  },
+
+  createHistoryEntry: (taskId, status, errorMessage, callback) => {
+    ExecutionHistoryModel.create(taskId, status, (err, history) => {
+      if (err) return callback(err);
+      
+      if (status === 'completed' || status === 'failed' || status === 'blocked') {
+        ExecutionHistoryModel.update(history.id, {
+          status,
+          completedAt: new Date().toISOString(),
+          errorMessage
+        }, (err, updatedHistory) => {
+          if (err) return callback(err);
+          callback(null, updatedHistory);
+        });
+      } else {
+        callback(null, history);
+      }
+    });
+  },
+
   startTask: (taskId, callback) => {
     TaskModel.findById(taskId, (err, task) => {
       if (err) return callback(err);
       if (!task) return callback(null, { error: 'Task not found' });
+
+      if (!ExecutionService.canTransition(task.status, 'running')) {
+        return callback(null, { 
+          error: `Cannot start task from status '${task.status}'`,
+          currentStatus: task.status 
+        });
+      }
 
       TaskModel.getDependencies(taskId, (err, dependencies) => {
         if (err) return callback(err);
@@ -30,7 +69,7 @@ const ExecutionService = {
         TaskModel.updateStatus(taskId, 'running', (err, updatedTask) => {
           if (err) return callback(err);
           
-          ExecutionHistoryModel.create(taskId, 'running', (err, history) => {
+          ExecutionService.createHistoryEntry(taskId, 'running', null, (err, history) => {
             if (err) return callback(err);
             callback(null, { task: updatedTask, history });
           });
@@ -40,47 +79,54 @@ const ExecutionService = {
   },
 
   completeTask: (taskId, callback) => {
-    TaskModel.updateStatus(taskId, 'completed', (err, updatedTask) => {
+    TaskModel.findById(taskId, (err, task) => {
       if (err) return callback(err);
-      if (!updatedTask) return callback(null, { error: 'Task not found' });
+      if (!task) return callback(null, { error: 'Task not found' });
 
-      ExecutionHistoryModel.getLatestByTaskId(taskId, (err, latestHistory) => {
+      if (!ExecutionService.canTransition(task.status, 'completed')) {
+        return callback(null, { 
+          error: `Cannot complete task from status '${task.status}'. Task must be 'running' first.`,
+          currentStatus: task.status 
+        });
+      }
+
+      TaskModel.updateStatus(taskId, 'completed', (err, updatedTask) => {
         if (err) return callback(err);
-        
-        if (latestHistory) {
-          ExecutionHistoryModel.update(latestHistory.id, {
-            status: 'completed',
-            completedAt: new Date().toISOString()
-          }, () => {});
-        }
 
-        TaskModel.getDependents(taskId, (err, dependents) => {
+        ExecutionService.createHistoryEntry(taskId, 'completed', null, (err, history) => {
           if (err) return callback(err);
-          callback(null, { task: updatedTask, affectedDependents: dependents });
+
+          TaskModel.getDependents(taskId, (err, dependents) => {
+            if (err) return callback(err);
+            callback(null, { task: updatedTask, history, affectedDependents: dependents });
+          });
         });
       });
     });
   },
 
   failTask: (taskId, errorMessage, callback) => {
-    TaskModel.updateStatus(taskId, 'failed', (err, updatedTask) => {
+    TaskModel.findById(taskId, (err, task) => {
       if (err) return callback(err);
-      if (!updatedTask) return callback(null, { error: 'Task not found' });
+      if (!task) return callback(null, { error: 'Task not found' });
 
-      ExecutionHistoryModel.getLatestByTaskId(taskId, (err, latestHistory) => {
+      if (!ExecutionService.canTransition(task.status, 'failed')) {
+        return callback(null, { 
+          error: `Cannot fail task from status '${task.status}'. Task must be 'running' first.`,
+          currentStatus: task.status 
+        });
+      }
+
+      TaskModel.updateStatus(taskId, 'failed', (err, updatedTask) => {
         if (err) return callback(err);
-        
-        if (latestHistory) {
-          ExecutionHistoryModel.update(latestHistory.id, {
-            status: 'failed',
-            completedAt: new Date().toISOString(),
-            errorMessage
-          }, () => {});
-        }
 
-        ExecutionService.propagateBlock(taskId, (err, blockedTasks) => {
+        ExecutionService.createHistoryEntry(taskId, 'failed', errorMessage || 'Task failed', (err, history) => {
           if (err) return callback(err);
-          callback(null, { task: updatedTask, blockedTasks });
+
+          ExecutionService.propagateBlock(taskId, (err, blockedTasks) => {
+            if (err) return callback(err);
+            callback(null, { task: updatedTask, history, blockedTasks });
+          });
         });
       });
     });
@@ -106,27 +152,20 @@ const ExecutionService = {
               if (blockedTask) {
                 blockedTasks.push(blockedTask);
                 
-                ExecutionHistoryModel.create(dependent.id, 'blocked', (err, history) => {
-                  if (err) console.error('Failed to create history:', err);
-                  
-                  ExecutionHistoryModel.getLatestByTaskId(dependent.id, (err, latestHistory) => {
-                    if (err) console.error('Failed to get latest history:', err);
-                    
-                    if (latestHistory && latestHistory.status !== 'blocked') {
-                      ExecutionHistoryModel.update(latestHistory.id, {
-                        status: 'blocked',
-                        completedAt: new Date().toISOString(),
-                        errorMessage: 'Blocked due to upstream task failure'
-                      }, () => {});
-                    }
+                ExecutionService.createHistoryEntry(
+                  dependent.id, 
+                  'blocked', 
+                  'Blocked due to upstream task failure',
+                  (err, history) => {
+                    if (err) console.error('Failed to create history:', err);
                     
                     blockDependents(dependent.id, (err) => {
                       if (err) return done(err);
                       processed++;
                       if (processed === total) done(null);
                     });
-                  });
-                });
+                  }
+                );
               } else {
                 processed++;
                 if (processed === total) done(null);
